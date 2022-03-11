@@ -1,5 +1,6 @@
 Babel
 PyQt5>=5.8.2
+pywayland
 setuptools>=38.2.4
 wheel
 
