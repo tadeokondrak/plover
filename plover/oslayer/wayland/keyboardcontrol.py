@@ -7,103 +7,287 @@ like Sway, as of January 2022).
 """
 
 import os
-import time
 import select
-from threading import Thread
+import threading
+import time
 
 from pywayland.client.display import Display
 from pywayland.protocol.wayland.wl_seat import WlSeat
 
-from plover.oslayer.xkeyboardcontrol import KEYCODE_TO_KEY, KEY_TO_KEYSYM
-from plover.key_combo import parse_key_combo, add_modifiers_aliases
+from plover.oslayer.xkeyboardcontrol import KEYCODE_TO_KEY
 
-# Protocol modules generated from XML description files at build time
+from .keyboardlayout import PLOVER_TAG, KeyComboLayout, StringOutputLayout
+# Protocol modules generated from XML description files at build time.
 from .input_method_unstable_v2 import ZwpInputMethodManagerV2
 from .virtual_keyboard_unstable_v1 import ZwpVirtualKeyboardManagerV1
 
 
-# Taken from the default XKB modifier mapping
-MOD_NAME_TO_INDEX = {
-    'shift_l': 0,
-    'shift_r': 0,
-    'lock': 1,
-    'caps_lock': 1,
-    'control_l': 2,
-    'control_r': 2,
-    'mod1': 3,
-    'alt_l': 3,
-    'meta_l': 3,
-    'alt_r': 3,
-    'meta_r': 3,
-    'mod2': 4,
-    'num_lock': 4,
-    'mod3': 5,
-    'mod4': 6,
-    'super_l': 6,
-    'super_r': 6,
-    'hyper_l': 6,
-    'hyper_r': 6,
-    'mod5': 7,
-    'iso_level3_shift': 7,
-    'mode_switch': 7,
-}
-add_modifiers_aliases(MOD_NAME_TO_INDEX)
+class KeyboardHandler:
 
-XKB_KEYCODE_OFFSET = 8
-PLOVER_TAG = '<PLVR>'
+    _INTERFACES = {
+        interface.name: (nick, interface)
+        for nick, interface in (
+            ('seat', WlSeat),
+            ('input_method', ZwpInputMethodManagerV2),
+            ('virtual_keyboard', ZwpVirtualKeyboardManagerV1),
+        )}
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.RLock()
+        self._loop_thread = None
+        self._pipe = None
+        # Common for capture and emulation.
+        self._display = None
+        self._interface = None
+        self._keyboard = None
+        self._keymap = None
+        self._replay_keyboard = None
+        self._replay_layout = None
+        # For capture only.
+        self._refcount_capture = 0
+        self._grabbed_keyboard = None
+        self._input_method = None
+        self._event_listeners = {
+            'grab_key': set(),
+            'grab_modifiers': set(),
+        }
+        # For emulation only.
+        self._refcount_emulate = 0
+        self._output_keyboard = None
+        self._output_layout = None
+
+    def _event_loop(self):
+        with self._lock:
+            readfds = (self._pipe[0], self._display.get_fd())
+        while True:
+            # Sleep until we get new data on the display connection,
+            # or on the pipe used to signal the end of the loop.
+            rlist, wlist, xlist = select.select(readfds, (), ())
+            assert not wlist
+            assert not xlist
+            if self._pipe[0] in rlist:
+                break
+            # If we're here, rlist should contains
+            # the display fd, process pending events.
+            with self._lock:
+                self._display.dispatch(block=True)
+                self._display.flush()
+
+    def __enter__(self):
+        self._lock.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None and self._display is not None:
+            self._display.flush()
+        self._lock.__exit__(exc_type, exc_value, traceback)
+
+    def _on_registry_global(self, obj, name, interface_name, interface_version):
+        if interface_name not in self._INTERFACES:
+            return
+        nick, interface = self._INTERFACES[interface_name]
+        self._interface[nick] = obj.bind(name, interface, interface_version)
+
+    def _on_keymap(self, __keyboard, fmt, fd, size):
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            keymap = os.read(fd, size)
+            is_generated = PLOVER_TAG in keymap
+            if is_generated or keymap == self._keymap:
+                return
+            self._replay_layout = KeyComboLayout(keymap)
+            self._replay_keyboard.keymap(fmt, fd, size)
+            self._keymap = keymap
+        finally:
+            os.close(fd)
+
+    def _on_grab_key(self, __grabbed_keyboard, __serial, origtime, keycode, state):
+        suppressed = False
+        try:
+            for cb in self._event_listeners['grab_key']:
+                suppressed |= cb(origtime, keycode, state)
+        finally:
+            if not suppressed:
+                self._replay_keyboard.key(origtime, keycode, state)
+
+    def _on_grab_modifiers(self, __grabbed_keyboard, __serial, depressed, latched, locked, layout):
+        suppressed = False
+        try:
+            for cb in self._event_listeners['grab_modifiers']:
+                suppressed |= cb(depressed, latched, locked, layout)
+        finally:
+            if not suppressed:
+                self._replay_keyboard.modifiers(depressed, latched, locked, layout)
+
+    def _update_output_keymap(self):
+        xkb_keymap = self._output_layout.to_xkb_def()
+        fd = os.memfd_create('emulated_keymap.xkb')
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, xkb_keymap)
+            self._output_keyboard.keymap(1, fd, len(xkb_keymap))
+        finally:
+            os.close(fd)
+
+    def _ensure_interfaces(self, mode, interface_list):
+        missing_interfaces = [
+            interface_name
+            for interface_name in interface_list
+            if interface_name not in self._interface
+        ]
+        if missing_interfaces:
+            missing_interfaces = ', '.join(f'\'{name}\'' for name in missing_interfaces)
+            raise RuntimeError(f'Cannot {mode} keyboard events: your '
+                               f'Wayland compositor does not support '
+                               f'the following interfaces: '
+                               f'{missing_interfaces}')
+
+    def _setup_base(self):
+        self._display = Display()
+        self._display.connect()
+        self._interface = {}
+        reg = self._display.get_registry()
+        reg.dispatcher['global'] = self._on_registry_global
+        self._display.roundtrip()
+        self._replay_keyboard = self._interface['virtual_keyboard'].create_virtual_keyboard(self._interface['seat'])
+        self._keyboard = self._interface['seat'].get_keyboard()
+        self._keyboard.dispatcher['keymap'] = self._on_keymap
+        self._display.roundtrip()
+        self._pipe = os.pipe()
+        self._loop_thread = threading.Thread(target=self._event_loop)
+        self._loop_thread.start()
+
+    def _teardown_base(self):
+        if self._loop_thread is not None:
+            # Wake up the capture thread...
+            os.write(self._pipe[1], b'quit')
+            # ...and wait for it to terminate.
+            self._loop_thread.join()
+            self._loop_thread = None
+            for fd in self._pipe:
+                os.close(fd)
+            self._pipe = None
+        self._replay_keyboard = None
+        self._replay_layout = None
+        self._keymap = None
+        if self._keyboard is not None:
+            self._keyboard.release()
+            self._keyboard = None
+        while self._interface:
+            self._interface.popitem()[1].release()
+        self._interface = None
+        if self._display is not None:
+            self._display.disconnect()
+            self._display = None
+
+    def _setup_capture(self):
+        self._ensure_interfaces('capture', ('seat', 'input_method', 'virtual_keyboard'))
+        self._input_method = self._interface['input_method'].get_input_method(self._interface['seat'])
+        self._grabbed_keyboard = self._input_method.grab_keyboard()
+        self._grabbed_keyboard.dispatcher['key'] = self._on_grab_key
+        self._grabbed_keyboard.dispatcher['modifiers'] = self._on_grab_modifiers
+
+    def _teardown_capture(self):
+        self._event_listeners['grab_key'].clear()
+        self._event_listeners['grab_modifiers'].clear()
+        if self._grabbed_keyboard is not None:
+            self._grabbed_keyboard.destroy()
+            self._grabbed_keyboard = None
+        if self._input_method is not None:
+            self._input_method.destroy()
+            self._input_method = None
+
+    def _setup_emulate(self):
+        self._ensure_interfaces('emulate', ('seat', 'virtual_keyboard'))
+        self._output_keyboard = self._interface['virtual_keyboard'].create_virtual_keyboard(self._interface['seat'])
+        self._output_layout = StringOutputLayout()
+        self._update_output_keymap()
+
+    def _teardown_emulate(self):
+        self._output_keyboard = None
+        self._output_layout = None
+
+    def incref(self, mode):
+        if mode not in ('capture', 'emulate'):
+            raise ValueError(mode)
+        refattr = '_refcount_' + mode
+        refcount = getattr(self, refattr) + 1
+        assert refcount >= 1
+        setattr(self, refattr, refcount)
+        try:
+            total_refcount = self._refcount_capture + self._refcount_emulate
+            if total_refcount == 1:
+                self._setup_base()
+            if refcount == 1:
+                getattr(self, '_setup_' + mode)()
+        except:
+            self.decref(mode)
+            raise
+
+    def decref(self, mode):
+        if mode not in ('capture', 'emulate'):
+            raise ValueError(mode)
+        refattr = '_refcount_' + mode
+        refcount = getattr(self, refattr) - 1
+        assert refcount >= 0
+        setattr(self, refattr, refcount)
+        if refcount == 0:
+            getattr(self, '_teardown_' + mode)()
+        if self._refcount_capture + self._refcount_emulate == 0:
+            self._teardown_base()
+
+    def add_event_listener(self, event, callback):
+        self._event_listeners[event].add(callback)
+
+    def remove_event_listener(self, event, callback):
+        self._event_listeners[event].discard(callback)
+
+    def send_string(self, string):
+        timestamp = time.thread_time_ns() // (10 ** 3)
+        keymap_updated, combo_list = self._output_layout.string_to_combos(string)
+        if keymap_updated:
+            self._update_output_keymap()
+        mods_state = 0
+        for keycode, mods in combo_list:
+            if mods != mods_state:
+                self._output_keyboard.modifiers(mods_depressed=mods,
+                                                mods_latched=0,
+                                                mods_locked=0,
+                                                group=0)
+                mods_state = mods
+            self._output_keyboard.key(timestamp, keycode, 1)
+            self._output_keyboard.key(timestamp, keycode, 0)
+        if mods_state:
+            self._output_keyboard.modifiers(mods_depressed=0,
+                                            mods_latched=0,
+                                            mods_locked=0,
+                                            group=0)
+
+    def send_backspaces(self, count):
+        timestamp = time.thread_time_ns() // (10 ** 3)
+        for __ in range(count):
+            self._output_keyboard.key(timestamp, 0, 1)
+            self._output_keyboard.key(timestamp, 0, 0)
+
+    def send_key_combination(self, combo_string):
+        timestamp = time.thread_time_ns() // (10 ** 3)
+        mods_state = 0
+        for (keycode, mods), pressed in self._replay_layout.parse_key_combo(combo_string):
+            self._replay_keyboard.key(timestamp, keycode, int(pressed))
+            if mods:
+                if pressed:
+                    mods_state |= mods
+                else:
+                    mods_state &= ~mods
+                self._replay_keyboard.modifiers(mods_depressed=mods_state,
+                                                mods_latched=0,
+                                                mods_locked=0,
+                                                group=0)
+        assert not mods_state
 
 
-def keymap_generate(keysyms):
-    """Generate a keymap that can send the given list of keysyms.
-
-    Argument:
-
-    keysyms -- List of keysyms to support.
-
-    Returns: A file descriptor for the new keymap, and the new keymap’s size.
-    """
-    keycodes = '\n'.join([
-        # Special keycode recognized by the keyboard capture class to
-        # avoid processing generated keys
-        f'{PLOVER_TAG} = {XKB_KEYCODE_OFFSET + len(keysyms)};'
-    ] + [
-        f'<C{keycode}> = {XKB_KEYCODE_OFFSET + keycode};'
-        for keycode, _ in enumerate(keysyms)
-    ])
-    symbols = '\n'.join([
-        f'key {PLOVER_TAG} {{[]}};'
-    ] + [
-        f'key <C{keycode}> {{[{keysym}]}};' \
-        for keycode, keysym in enumerate(keysyms)
-    ])
-    # Sway is more permissive than Xwayland on what an XKB keymap must
-    # or must not include. We need to take care if we want to ensure
-    # compatibility with both. See <https://github.com/atx/wtype/issues/1>
-    keymap = f'''xkb_keymap {{
-xkb_keycodes {{
-minimum = {XKB_KEYCODE_OFFSET};
-maximum = {XKB_KEYCODE_OFFSET + len(keysyms)};
-{keycodes}
-}};
-xkb_types {{ include \"complete\" }};
-xkb_compatibility {{ include \"complete\" }};
-xkb_symbols {{
-{symbols}
-}};
-}};'''
-    fd = os.memfd_create('emulated_keymap.xkb')
-    os.truncate(fd, len(keymap))
-    file = open(fd, 'w', closefd=False)
-    file.write(keymap)
-    file.flush()
-    return fd, len(keymap)
-
-
-def keymap_is_generated(fd):
-    """Check whether a keymap was generated from this module."""
-    file = open(fd, closefd=False)
-    keymap = file.read()
-    return keymap.find(PLOVER_TAG) >= 0
+_keyboard = KeyboardHandler()
 
 
 class KeyboardCapture:
@@ -118,175 +302,54 @@ class KeyboardCapture:
     to avoid infinite feedback loops.
     """
     def __init__(self):
-        # Callbacks that receive keypresses
+        self._started = False
+        self._mod_state = 0
+        self._grabbed_keyboard = None
+        self._suppressed_keys = set()
+        # Callbacks that receive keypresses.
         self.key_down = lambda key: None
         self.key_up = lambda key: None
 
-        # True if the event loop is running
-        self._running = False
-        self._loop_thread = None
-
-        # Global Wayland objects
-        self._display = None
-        self._seat = None
-        self._keyboard = None
-
-        # True if the keyboard has been grabbed
-        self._grabbed = False
-
-        # Keyboard grab and virtual keyboard objects
-        self._input_method_manager = None
-        self._input_method = None
-        self._grabbed_keyboard = None
-        self._virtual_keyboard_manager = None
-        self._virtual_keyboard = None
-
-        # Current modifier state, depressed, latched and locked
-        self._mod_state = 0
-
-        # True if the next received keypresses should be ignored
-        # because they are generated by KeyboardEmulation
-        self._is_generated = False
-
-        # Set of keys to capture and transmit to Plover - other keys
-        # are forwarded to the client transparently
-        self._suppressed_keys = set()
-
     def start(self):
         """Connect to the Wayland compositor and start the event loop."""
-        if not self._running:
-            self._display = Display()
-            self._display.connect()
-
-            # Query protocols available in the current compositor
-            reg = self._display.get_registry()
-            reg.dispatcher['global'] = self._on_registry_global
-            self._display.roundtrip()
-
-            for obj, interface in (
-                (self._seat, WlSeat),
-                (self._input_method_manager, ZwpInputMethodManagerV2),
-                (self._virtual_keyboard_manager, ZwpVirtualKeyboardManagerV1),
-            ):
-                if not obj:
-                    raise RuntimeError(f'Cannot capture keyboard events: your \
-Wayland compositor does not support the \'{interface.name}\' interface')
-
-            # Wait for an active keyboard to be ready before grabbing (in some
-            # cases, there might not be any active keyboard, for example if the
-            # last active keyboard was just unplugged - trying to grab the
-            # keyboard in this scenario would crash the compositor)
-            self._keyboard = self._seat.get_keyboard()
-            self._keyboard.dispatcher['keymap'] = self._on_keyboard_ready
-
-            self._running = True
-            self._loop_thread = Thread(target=self._event_loop)
-            self._loop_thread.start()
+        with _keyboard:
+            _keyboard.add_event_listener('grab_key', self._on_grab_key)
+            _keyboard.add_event_listener('grab_modifiers', self._on_grab_modifiers)
+            _keyboard.incref('capture')
+        self._started = True
 
     def cancel(self):
         """Cancel grabbing the keyboard and free resources."""
-        if self._running:
-            self._running = False
-            self._loop_thread.join()
-            self._loop_thread = None
+        if not self._started:
+            return
+        with _keyboard:
+            _keyboard.decref('capture')
+            _keyboard.remove_event_listener('grab_key', self._on_grab_key)
+            _keyboard.remove_event_listener('grab_modifiers', self._on_grab_modifiers)
+        self._started = False
 
-            if self._grabbed:
-                self._grabbed = False
-                self._virtual_keyboard.destroy()
-                self._virtual_keyboard = None
-                self._input_method.destroy()
-                self._input_method = None
-                self._grabbed_keyboard = None
-                self._virtual_keyboard_manager = None
-                self._input_method_manager = None
-
-            if self._keyboard:
-                self._keyboard.release()
-                self._keyboard = None
-
-            if self._seat:
-                self._seat.release()
-                self._seat = None
-
-            self._display.disconnect()
-            self._display = None
-
-    def _event_loop(self):
-        """Read incoming events repeatedly."""
-        fd = self._display.get_fd()
-
-        while self._running:
-            # Send any remaining requests
-            self._display.flush()
-
-            # Wait for events from the server and process them
-            read, _, _ = select.select((fd,), (), (), 1)
-            if read: self._display.dispatch(block=True)
-
-    def _on_registry_global(self, obj, name, interface, version):
-        """Listener for global objects advertised by the Wayland compositor."""
-        if interface == WlSeat.name:
-            self._seat = obj.bind(name, WlSeat, version)
-        elif interface == ZwpInputMethodManagerV2.name:
-            self._input_method_manager = \
-                obj.bind(name, ZwpInputMethodManagerV2, version)
-        elif interface == ZwpVirtualKeyboardManagerV1.name:
-            self._virtual_keyboard_manager = \
-                obj.bind(name, ZwpVirtualKeyboardManagerV1, version)
-
-    def _on_keyboard_ready(self, _, fmt, fd, size):
-        if not self._grabbed:
-            # Now that the source keyboard is ready, try grabbing its events
-            self._grabbed = True
-            self._input_method = \
-                self._input_method_manager.get_input_method(self._seat)
-            self._grabbed_keyboard = self._input_method.grab_keyboard()
-            self._virtual_keyboard = \
-                self._virtual_keyboard_manager.create_virtual_keyboard( \
-                    self._seat)
-
-            self._grabbed_keyboard.dispatcher['keymap'] = self._on_grab_keymap
-            self._grabbed_keyboard.dispatcher['modifiers'] = \
-                self._on_grab_modifiers
-            self._grabbed_keyboard.dispatcher['key'] = self._on_grab_key
-
-        os.close(fd)
-
-    def _on_grab_keymap(self, _, fmt, fd, size):
-        """Callback for when the active keymap changes."""
-        self._is_generated = fmt == 1 and keymap_is_generated(fd)
-        self._virtual_keyboard.keymap(fmt, fd, size)
-        self._display.flush()
-        os.close(fd)
-
-    def _on_grab_key(self, _, serial, origtime, keycode, state):
+    def _on_grab_key(self, __origtime, keycode, state):
         """Callback for when a new key event arrives."""
-        if self._is_generated:
-            suppressed = False
-        else:
-            key = KEYCODE_TO_KEY.get(keycode + 8)
-            if key is None:
+        key = KEYCODE_TO_KEY.get(keycode + 8)
+        if key is None:
+            # Unhandled, ignore and don't suppress.
+            return False
+        suppressed = key in self._suppressed_keys
+        if state == 1:
+            if self._mod_state:
+                # Modifier(s) pressed, ignore.
                 suppressed = False
             else:
-                suppressed = key in self._suppressed_keys
-                if state == 1:
-                    if self._mod_state:
-                        # Modifier(s) pressed, ignore.
-                        suppressed = False
-                    else:
-                        self.key_down(key)
-                else:
-                    self.key_up(key)
-        if not suppressed:
-            self._virtual_keyboard.key(origtime, keycode, state)
-            self._display.flush()
+                self.key_down(key)
+        else:
+            self.key_up(key)
+        return suppressed
 
-    def _on_grab_modifiers(self, _, serial, depressed, latched, locked, layout):
+    def _on_grab_modifiers(self, depressed, latched, locked, __layout):
         """Callback for when the set of active modifiers changes."""
         # Note: ignore numlock state.
         self._mod_state = (depressed | latched | locked) & ~0x10
-        self._virtual_keyboard.modifiers(depressed, latched, locked, layout)
-        self._display.flush()
+        return False
 
     def suppress_keyboard(self, keys=()):
         """Change the set of keys to capture."""
@@ -304,130 +367,23 @@ class KeyboardEmulation:
     generated XKB layouts.
     """
     def __init__(self):
-        # True if the required interfaces for sending key events are setup
-        self._ready = False
+        with _keyboard:
+            _keyboard.incref('emulate')
 
-        # Global Wayland objects
-        self._display = Display()
-        self._display.connect()
-        self._seat = None
-
-        # Virtual keyboard objects
-        self._virtual_keyboard_manager = None
-        self._virtual_keyboard = None
-
-        # Query protocols available in the current compositor
-        reg = self._display.get_registry()
-        reg.dispatcher['global'] = self._on_registry_global
-        self._display.roundtrip()
-
-        for obj, interface in (
-            (self._seat, WlSeat),
-            (self._virtual_keyboard_manager, ZwpVirtualKeyboardManagerV1),
-        ):
-            if not obj:
-                raise RuntimeError(f'Cannot emulate keyboard events: your \
-Wayland compositor does not support the \'{interface.name}\' interface')
-
-        self._virtual_keyboard = \
-            self._virtual_keyboard_manager.create_virtual_keyboard(self._seat)
-        self._ready = True
-
-    def close(self, type, value, traceback):
-        """Destroy the virtual keyboard and free resources."""
-        self._ready = False
-
-        if self._virtual_keyboard:
-            self._virtual_keyboard.destroy()
-            self._virtual_keyboard = None
-
-        if self._seat:
-            self._seat.release()
-            self._seat = None
-
-        if self._display:
-            self._display.disconnect()
-            self._display = None
-
-    def _on_registry_global(self, obj, name, interface, version):
-        """Listener for global objects advertised by the Wayland compositor."""
-        if interface == WlSeat.name:
-            self._seat = obj.bind(name, WlSeat, version)
-        elif interface == ZwpVirtualKeyboardManagerV1.name:
-            self._virtual_keyboard_manager = \
-                obj.bind(name, ZwpVirtualKeyboardManagerV1, version)
-
-    def _send_keymap(self, keysyms):
-        """Set virtual keymap to support a given list of keysyms."""
-        fd, size = keymap_generate(keysyms)
-        self._virtual_keyboard.keymap(1, fd, size)
-        self._display.flush()
-        os.close(fd)
-
-    def _send_key(self, keycode, state):
-        """Emulate a single keypress."""
-        timestamp = time.thread_time_ns() // (10 ** 3)
-        self._virtual_keyboard.key(timestamp, keycode, state)
-
-    def _send_modifiers(self, mods):
-        """Emulate changing the active modifiers."""
-        self._virtual_keyboard.modifiers(
-            mods_depressed=mods,
-            mods_latched=0,
-            mods_locked=0,
-            group=0,
-        )
-
-    def send_string(self, string):
+    @staticmethod
+    def send_string(string):
         """Emulate a complete string."""
-        if not self._ready:
-            raise RuntimeError('Cannot send string: keyboard emulation \
-is not available')
+        with _keyboard:
+            _keyboard.send_string(string)
 
-        letterset = list(set(string))
-        keysyms = [f'U{ord(letter):04X}' for letter in letterset]
-        self._send_keymap(keysyms)
-
-        for letter in string:
-            self._send_key(letterset.index(letter), 1)
-            self._send_key(letterset.index(letter), 0)
-
-        self._display.flush()
-
-    def send_backspaces(self, count):
+    @staticmethod
+    def send_backspaces(count):
         """Emulate a sequence of backspaces."""
-        if not self._ready:
-            raise RuntimeError('Cannot send backspaces: keyboard emulation \
-is not available')
+        with _keyboard:
+            _keyboard.send_backspaces(count)
 
-        self._send_keymap(['BackSpace'])
-
-        for _ in range(count):
-            self._send_key(0, 1)
-            self._send_key(0, 0)
-
-        self._display.flush()
-
-    def send_key_combination(self, combo_string):
+    @staticmethod
+    def send_key_combination(combo_string):
         """Emulate a key combo."""
-        combo = parse_key_combo(combo_string)
-
-        keyset = list(set([
-            key[0] for key in combo
-            if key[0] not in MOD_NAME_TO_INDEX
-        ]))
-        keysyms = [str(KEY_TO_KEYSYM[key]) for key in keyset]
-        self._send_keymap(keysyms)
-
-        mods = 0
-
-        for key, state in combo:
-            if key in MOD_NAME_TO_INDEX:
-                index = MOD_NAME_TO_INDEX[key]
-                if state: mods |= (1 << index)
-                else: mods &= ~(1 << index)
-                self._send_modifiers(mods)
-            else:
-                self._send_key(keyset.index(key), state)
-
-        self._display.flush()
+        with _keyboard:
+            _keyboard.send_key_combination(combo_string)

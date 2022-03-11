@@ -11,5 +11,6 @@ pywayland; ("linux" in sys_platform or "bsd" in sys_platform)
 rtf_tokenize
 setuptools
 wcwidth
+xkbcommon>=0.4; ("linux" in sys_platform or "bsd" in sys_platform)
 
 # vim: ft=cfg commentstring=#\ %s list
