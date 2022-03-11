@@ -27,16 +27,18 @@ from plover_build_utils.setup import (
 )
 
 
-BuildPy.build_dependencies.append('build_wayland')
 BuildPy.build_dependencies.append('build_ui')
 Develop.build_dependencies.append('build_py')
 cmdclass = {
     'build_py': BuildPy,
     'build_ui': BuildUi,
-    'build_wayland': BuildWayland,
     'develop': Develop,
 }
 options = {}
+
+if sys.platform.startswith(('linux', 'freebsd', 'openbsd')):
+    BuildPy.build_dependencies.insert(0, 'build_wayland')
+    cmdclass['build_wayland'] = BuildWayland
 
 PACKAGE = '%s-%s' % (
     __software_name__,
