@@ -1,9 +1,11 @@
 from distutils import log
+from pathlib import Path
 import contextlib
 import glob
 import importlib
 import os
 import subprocess
+import shutil
 import sys
 
 from setuptools.command.build_py import build_py
@@ -172,6 +174,14 @@ class BuildWayland(Command):
             '-i', *defs, '-o', base,
         )
         subprocess.check_call(cmd)
+        shutil.rmtree('plover/oslayer/wayland/wayland')
+        for py in Path('plover/oslayer/wayland').glob('*/*.py'):
+            contents = py.read_text()
+            contents = contents.replace(
+                '\nfrom ..wayland import ',
+                '\nfrom pywayland.protocol.wayland import ',
+            )
+            py.write_text(contents)
 
 # }}}
 
