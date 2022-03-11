@@ -26,7 +26,7 @@ KEYBOARDCONTROL_NOT_FOUND_FOR_OS = \
 
 if PLATFORM in {'linux', 'bsd'}:
     if os.environ.get('WAYLAND_DISPLAY', None):
-        from plover.oslayer import waykeyboardcontrol as keyboardcontrol
+        from plover.oslayer.wayland import keyboardcontrol
     else:
         from plover.oslayer import xkeyboardcontrol as keyboardcontrol
 elif PLATFORM == 'win':

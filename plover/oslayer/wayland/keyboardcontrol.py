@@ -14,12 +14,12 @@ from threading import Thread
 from pywayland.client.display import Display
 from pywayland.protocol.wayland.wl_seat import WlSeat
 
-# Protocol modules generated from XML description files at build time
-from .wayland.input_method_unstable_v2 import ZwpInputMethodManagerV2
-from .wayland.virtual_keyboard_unstable_v1 import ZwpVirtualKeyboardManagerV1
-
 from plover.oslayer.xkeyboardcontrol import KEYCODE_TO_KEY, KEY_TO_KEYSYM
 from plover.key_combo import parse_key_combo, add_modifiers_aliases
+
+# Protocol modules generated from XML description files at build time
+from .input_method_unstable_v2 import ZwpInputMethodManagerV2
+from .virtual_keyboard_unstable_v1 import ZwpVirtualKeyboardManagerV1
 
 
 # Taken from the default XKB modifier mapping
