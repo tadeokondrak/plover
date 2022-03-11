@@ -261,14 +261,23 @@ Wayland compositor does not support the \'{interface.name}\' interface')
 
     def _on_grab_key(self, _, serial, origtime, keycode, state):
         """Callback for when a new key event arrives."""
-        key = KEYCODE_TO_KEY.get(keycode + 8)
-
-        if not self._is_generated and key in self._suppressed_keys and not self._mod_state:
-            # Signal and suppress changes for watched keys
-            if state == 1: self.key_down(key)
-            else: self.key_up(key)
+        if self._is_generated:
+            suppressed = False
         else:
-            # Forward other keys unchanged
+            key = KEYCODE_TO_KEY.get(keycode + 8)
+            if key is None:
+                suppressed = False
+            else:
+                suppressed = key in self._suppressed_keys
+                if state == 1:
+                    if self._mod_state:
+                        # Modifier(s) pressed, ignore.
+                        suppressed = False
+                    else:
+                        self.key_down(key)
+                else:
+                    self.key_up(key)
+        if not suppressed:
             self._virtual_keyboard.key(origtime, keycode, state)
             self._display.flush()
 
