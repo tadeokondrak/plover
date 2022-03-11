@@ -16,21 +16,27 @@ emulate keyboard input.
 
 """
 
-from plover.oslayer.config import DISPLAY_SERVER
+import os
+
+from plover import log
+from plover.oslayer.config import PLATFORM
 
 KEYBOARDCONTROL_NOT_FOUND_FOR_OS = \
-        "No keyboard control module was found for platform: %s" % DISPLAY_SERVER
+        "No keyboard control module was found for platform: %s" % PLATFORM
 
-if DISPLAY_SERVER == 'xorg':
-    from plover.oslayer import xkeyboardcontrol as keyboardcontrol
-elif DISPLAY_SERVER == 'wayland':
-    from plover.oslayer import waykeyboardcontrol as keyboardcontrol
-elif DISPLAY_SERVER == 'win':
+if PLATFORM in {'linux', 'bsd'}:
+    if os.environ.get('WAYLAND_DISPLAY', None):
+        from plover.oslayer import waykeyboardcontrol as keyboardcontrol
+    else:
+        from plover.oslayer import xkeyboardcontrol as keyboardcontrol
+elif PLATFORM == 'win':
     from plover.oslayer import winkeyboardcontrol as keyboardcontrol
-elif DISPLAY_SERVER == 'mac':
+elif PLATFORM == 'mac':
     from plover.oslayer import osxkeyboardcontrol as keyboardcontrol
 else:
     raise Exception(KEYBOARDCONTROL_NOT_FOUND_FOR_OS)
+
+log.info('using `%s` for keyboard control', keyboardcontrol.__name__)
 
 
 class KeyboardCapture(keyboardcontrol.KeyboardCapture):
