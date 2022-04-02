@@ -25,6 +25,44 @@ xkb_symbols {
 '''
 )
 
+XKB_ALIASES = (
+    ('apostrophe', 'quoteright'),
+    ('f11', 'l1'),
+    ('f12', 'l2'),
+    ('f13', 'l3'),
+    ('f14', 'l4'),
+    ('f15', 'l5'),
+    ('f16', 'l6'),
+    ('f17', 'l7'),
+    ('f18', 'l8'),
+    ('f19', 'l9'),
+    ('f20', 'l10'),
+    ('f21', 'r1'),
+    ('f22', 'r2'),
+    ('f23', 'r3'),
+    ('f24', 'r4'),
+    ('f25', 'r5'),
+    ('f26', 'r6'),
+    ('f27', 'r7'),
+    ('f28', 'r8'),
+    ('f29', 'r9'),
+    ('f30', 'r10'),
+    ('f31', 'r11'),
+    ('f32', 'r12'),
+    ('f33', 'r13'),
+    ('f34', 'r14'),
+    ('f35', 'r15'),
+    ('grave', 'quoteleft'),
+    ('henkan', 'henkan_mode'),
+    ('kp_next', 'kp_page_down'),
+    ('kp_page_up', 'kp_prior'),
+    ('mae_koho', 'previouscandidate'),
+    ('mode_switch', 'script_switch'),
+    ('multiplecandidate', 'zen_koho'),
+    ('next', 'page_down'),
+    ('page_up', 'prior'),
+)
+
 
 class KeyComboLayout:
 
@@ -74,6 +112,13 @@ class KeyComboLayout:
                     combo_from_keyname[alias] = combo
                 keysym_level[keysym] = level
         add_modifiers_aliases(combo_from_keyname)
+        # Ensure all aliases for the same keysim are available.
+        for alias_list in XKB_ALIASES:
+            combo = next(filter(None, map(combo_from_keyname.get, alias_list)), None)
+            if combo is not None:
+                for alias in alias_list:
+                    if alias not in combo_from_keyname:
+                        combo_from_keyname[alias] = combo
         self._combo_from_keyname = combo_from_keyname
 
     def parse_key_combo(self, combo_string):
