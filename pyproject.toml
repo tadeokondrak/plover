@@ -2,6 +2,7 @@
 requires = [
 	"Babel",
 	"PyQt5>=5.8.2",
+	"pywayland; ('linux' in sys_platform or 'bsd' in sys_platform)",
 	"setuptools>=38.2.4",
 	"wheel",
 ]
