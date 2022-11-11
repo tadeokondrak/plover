@@ -66,10 +66,10 @@ class TrayIcon(QObject):
                 icon = QMessageBox.Warning
             else:
                 icon = QMessageBox.Critical
-            msgbox = QMessageBox()
-            msgbox.setText(message)
-            msgbox.setIcon(icon)
-            msgbox.exec_()
+            # msgbox = QMessageBox()
+            # msgbox.setText(message)
+            # msgbox.setIcon(icon)
+            # msgbox.exec_()
 
     def is_supported(self):
         return self._supported
