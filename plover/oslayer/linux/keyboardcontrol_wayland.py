@@ -14,9 +14,10 @@ import time
 from pywayland.client.display import Display
 from pywayland.protocol.wayland.wl_seat import WlSeat
 
-from plover.oslayer.xkeyboardcontrol import KEYCODE_TO_KEY
+from plover.oslayer.keyboardcontrol_x11 import KEYCODE_TO_KEY
+from plover.engine import StartingStrokeState
 
-from .keyboardlayout import PLOVER_TAG, KeyComboLayout, StringOutputLayout
+from .keyboardlayout_wayland import PLOVER_TAG, KeyComboLayout, StringOutputLayout
 # Protocol modules generated from XML description files at build time.
 from .input_method_unstable_v2 import ZwpInputMethodManagerV2
 from .virtual_keyboard_unstable_v1 import ZwpVirtualKeyboardManagerV1
@@ -44,10 +45,13 @@ class KeyboardHandler:
         self._keymap = None
         self._replay_keyboard = None
         self._replay_layout = None
+        self._input_method = None
+        self._input_method_serial = 0
+        self._input_method_state = None
+        self._input_method_pending_state = None
         # For capture only.
         self._refcount_capture = 0
         self._grabbed_keyboard = None
-        self._input_method = None
         self._event_listeners = {
             'grab_key': set(),
             'grab_modifiers': set(),
@@ -56,6 +60,8 @@ class KeyboardHandler:
         self._refcount_emulate = 0
         self._output_keyboard = None
         self._output_layout = None
+        # Hack
+        self._engine = None
 
     def _event_loop(self):
         with self._lock:
@@ -120,6 +126,91 @@ class KeyboardHandler:
             if not suppressed:
                 self._replay_keyboard.modifiers(depressed, latched, locked, layout)
 
+    def _on_im_activate(self, __input_method):
+        self._input_method_pending_state = {
+            "activate": True,
+            "surrounding_text": None,
+            "surrounding_text_cursor": None,
+            "surrounding_text_anchor": None,
+            "text_change_cause": 0,
+            "content_hint": 0,
+            "content_type": 0,
+        }
+
+    def _on_im_deactivate(self, __input_method):
+        self._input_method_pending_state = {
+            "deactivate": True,
+        }
+
+    def _on_im_surrounding_text(self, __input_method, text, cursor, anchor):
+        self._input_method_pending_state["surrounding_text"] = text
+        self._input_method_pending_state["surrounding_text_cursor"] = cursor
+        self._input_method_pending_state["surrounding_text_anchor"] = anchor
+
+    def _on_im_content_type(self, __input_method, hint, purpose):
+        self._input_method_pending_state["content_hint"] = hint
+        self._input_method_pending_state["content_purpose"] = purpose
+
+    def _on_im_done(self, __input_method):
+        self._input_method_serial += 1
+        if "deactivate" in self._input_method_pending_state:
+            self._input_method_state = None
+            self._input_method_pending_state = None
+            self._engine.clear_translator_state()
+            return
+        if "activate" in self._input_method_pending_state:
+            del self._input_method_pending_state["activate"]
+            if self._input_method_pending_state["surrounding_text"] is not None:
+                text = self._input_method_pending_state["surrounding_text"].encode("utf-8")
+                cursor = self._input_method_pending_state["surrounding_text_cursor"]
+                text_before = text[:cursor].decode("utf-8")
+                state = self._engine.starting_stroke_state
+                if text_before.endswith(".") or text_before.endswith(",") or text_before.endswith("?") or text_before.endswith("!"):
+                    state = StartingStrokeState(
+                        attach=False,
+                        capitalize=True,
+                        space_char=state.space_char,
+                    )
+                elif text_before.endswith(". ") or text_before.endswith(", ") or text_before.endswith("? ") or text_before.endswith("! "):
+                    state = StartingStrokeState(
+                        attach=True,
+                        capitalize=True,
+                        space_char=state.space_char,
+                    )
+                elif text_before.endswith(" "):
+                    state = StartingStrokeState(
+                        attach=True,
+                        capitalize=False,
+                        space_char=state.space_char,
+                    )
+                elif text_before == "":
+                    state = StartingStrokeState(
+                        attach=True,
+                        capitalize=True,
+                        space_char=state.space_char,
+                    )
+                else:
+                    state = StartingStrokeState(
+                        attach=False,
+                        capitalize=False,
+                        space_char=state.space_char,
+                    )
+                self._engine.starting_stroke_state = state
+            else:
+                state = self._engine.starting_stroke_state
+                state = StartingStrokeState(
+                    attach=True,
+                    capitalize=False,
+                    space_char=state.space_char,
+                )
+                self._engine.starting_stroke_state = state
+
+            self._engine.clear_translator_state()
+        self._input_method_state = self._input_method_pending_state
+
+    def _on_text_change_cause(self, cause):
+        self._input_method_pending_state["text_change_cause"] = cause
+
     def _update_output_keymap(self):
         xkb_keymap = self._output_layout.to_xkb_def()
         fd = os.memfd_create('emulated_keymap.xkb')
@@ -153,10 +244,18 @@ class KeyboardHandler:
         self._replay_keyboard = self._interface['virtual_keyboard'].create_virtual_keyboard(self._interface['seat'])
         self._keyboard = self._interface['seat'].get_keyboard()
         self._keyboard.dispatcher['keymap'] = self._on_keymap
+        self._input_method = self._interface['input_method'].get_input_method(self._interface['seat'])
+        self._input_method_serial = 0
+        self._input_method.dispatcher['activate'] = self._on_im_activate
+        self._input_method.dispatcher['deactivate'] = self._on_im_deactivate
+        self._input_method.dispatcher['surrounding_text'] = self._on_im_surrounding_text
+        self._input_method.dispatcher['content_type'] = self._on_im_content_type
+        self._input_method.dispatcher['done'] = self._on_im_done
         self._display.roundtrip()
         self._pipe = os.pipe()
         self._loop_thread = threading.Thread(target=self._event_loop)
         self._loop_thread.start()
+        self._ensure_interfaces('capture or emulation', ('seat', 'input_method'))
 
     def _teardown_base(self):
         if self._loop_thread is not None:
@@ -174,6 +273,9 @@ class KeyboardHandler:
         if self._keyboard is not None:
             self._keyboard.release()
             self._keyboard = None
+        if self._input_method is not None:
+            self._input_method.destroy()
+            self._input_method = None
         while self._interface:
             self._interface.popitem()[1].release()
         self._interface = None
@@ -182,8 +284,7 @@ class KeyboardHandler:
             self._display = None
 
     def _setup_capture(self):
-        self._ensure_interfaces('capture', ('seat', 'input_method', 'virtual_keyboard'))
-        self._input_method = self._interface['input_method'].get_input_method(self._interface['seat'])
+        self._ensure_interfaces('capture', ('seat', 'input_method'))
         self._grabbed_keyboard = self._input_method.grab_keyboard()
         self._grabbed_keyboard.dispatcher['key'] = self._on_grab_key
         self._grabbed_keyboard.dispatcher['modifiers'] = self._on_grab_modifiers
@@ -194,12 +295,9 @@ class KeyboardHandler:
         if self._grabbed_keyboard is not None:
             self._grabbed_keyboard.destroy()
             self._grabbed_keyboard = None
-        if self._input_method is not None:
-            self._input_method.destroy()
-            self._input_method = None
 
     def _setup_emulate(self):
-        self._ensure_interfaces('emulate', ('seat', 'virtual_keyboard'))
+        self._ensure_interfaces('emulate', ('seat', 'input_method', 'virtual_keyboard'))
         self._output_keyboard = self._interface['virtual_keyboard'].create_virtual_keyboard(self._interface['seat'])
         self._output_layout = StringOutputLayout()
         self._update_output_keymap()
@@ -243,7 +341,20 @@ class KeyboardHandler:
     def remove_event_listener(self, event, callback):
         self._event_listeners[event].discard(callback)
 
+    def set_engine(self, engine):
+        self._engine = engine
+
     def send_string(self, string):
+        if self._input_method_state is not None:
+            self._send_string_im(string)
+        else:
+            self._send_string_kb(string)
+
+    def _send_string_im(self, string):
+        self._input_method.commit_string(string)
+        self._input_method.commit(self._input_method_serial)
+
+    def _send_string_kb(self, string):
         timestamp = time.thread_time_ns() // (10 ** 3)
         keymap_updated, combo_list = self._output_layout.string_to_combos(string)
         if keymap_updated:
@@ -264,11 +375,16 @@ class KeyboardHandler:
                                             mods_locked=0,
                                             group=0)
 
+
     def send_backspaces(self, count):
-        timestamp = time.thread_time_ns() // (10 ** 3)
-        for __ in range(count):
-            self._output_keyboard.key(timestamp, 0, 1)
-            self._output_keyboard.key(timestamp, 0, 0)
+        if self._input_method_state is not None and self._input_method_state["surrounding_text"] is not None:
+            self._input_method.delete_surrounding_text(count, 0)
+            self._input_method.commit(self._input_method_serial)
+        else:
+            timestamp = time.thread_time_ns() // (10 ** 3)
+            for __ in range(count):
+                self._output_keyboard.key(timestamp, 0, 1)
+                self._output_keyboard.key(timestamp, 0, 0)
 
     def send_key_combination(self, combo_string):
         timestamp = time.thread_time_ns() // (10 ** 3)
@@ -387,3 +503,8 @@ class KeyboardEmulation:
         """Emulate a key combo."""
         with _keyboard:
             _keyboard.send_key_combination(combo_string)
+
+    @staticmethod
+    def set_engine(engine):
+        with _keyboard:
+            _keyboard.set_engine(engine)

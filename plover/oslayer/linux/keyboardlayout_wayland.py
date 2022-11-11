@@ -1,7 +1,7 @@
 from xkbcommon import xkb
 
 from plover.key_combo import add_modifiers_aliases, parse_key_combo
-from plover.oslayer.xkeyboardcontrol import uchr_to_keysym
+from plover.oslayer.keyboardcontrol_x11 import uchr_to_keysym
 
 
 XKB_KEYCODE_OFFSET = 8

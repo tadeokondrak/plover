@@ -185,7 +185,7 @@ class BuildWayland(Command):
 
     def run(self):
         log.info("generating Wayland protocol modules")
-        base = "plover/oslayer/wayland"
+        base = "plover/oslayer/linux"
         defs = glob.glob(base + "/*.xml") + ["/usr/share/wayland/wayland.xml"]
         cmd = (
             sys.executable,
@@ -197,8 +197,8 @@ class BuildWayland(Command):
             base,
         )
         subprocess.check_call(cmd)
-        shutil.rmtree("plover/oslayer/wayland/wayland")
-        for py in Path("plover/oslayer/wayland").glob("*/*.py"):
+        shutil.rmtree("plover/oslayer/linux/wayland")
+        for py in Path("plover/oslayer/linux").glob("*/*.py"):
             contents = py.read_text()
             contents = contents.replace(
                 "\nfrom ..wayland import ",

@@ -120,6 +120,8 @@ class StenoEngine:
         self._running_state = self._translator.get_state()
         self._translator.clear_state()
         self._keyboard_emulation = keyboard_emulation
+        if hasattr(keyboard_emulation, 'set_engine'):
+            keyboard_emulation.set_engine(self)
         self._hooks = { hook: [] for hook in self.HOOKS }
         self._running_extensions = {}
 
@@ -348,6 +350,11 @@ class StenoEngine:
             return True
         elif command_name == 'toggle':
             self._toggle_output()
+            return True
+        elif command_name == 'reset':
+            if self._is_running:
+                self._set_output(False)
+                self._set_output(True)
             return True
         elif command_name == 'quit':
             self.quit()

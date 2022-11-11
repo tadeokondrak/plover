@@ -65,6 +65,7 @@ class Application:
         QApplication.setQuitOnLastWindowClosed(False)
 
         self._app.engine = self._engine = Engine(config, controller, KeyboardEmulation())
+
         # On macOS, quitting through the dock will result
         # in a direct call to `QCoreApplication.quit`.
         self._app.aboutToQuit.connect(self._app.engine.quit)

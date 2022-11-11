@@ -20,7 +20,7 @@ include plover/gui_qt/resources/*.qrc
 include plover/gui_qt/resources/*.svg
 include plover/messages/*/LC_MESSAGES/*.po
 include plover/messages/plover.pot
-include plover/oslayer/wayland/*.xml
+include plover/oslayer/linux/*.xml
 include plover_build_utils/*.sh
 include pyproject.toml
 include pytest.ini
@@ -35,7 +35,7 @@ exclude .gitignore
 exclude plover/gui_qt/*_rc.py
 exclude plover/gui_qt/*_ui.py
 exclude plover/gui_qt/.gitignore
-exclude plover/oslayer/wayland/.gitignore
-prune plover/oslayer/wayland/input_method_unstable_v2
-prune plover/oslayer/wayland/virtual_keyboard_unstable_v1
+exclude plover/oslayer/linux/.gitignore
+prune plover/oslayer/linux/input_method_unstable_v2
+prune plover/oslayer/linux/virtual_keyboard_unstable_v1
 prune .github
