@@ -345,7 +345,7 @@ class KeyboardHandler:
         self._engine = engine
 
     def send_string(self, string):
-        if self._input_method_state is not None:
+        if False and self._input_method_state is not None:
             self._send_string_im(string)
         else:
             self._send_string_kb(string)
@@ -377,7 +377,7 @@ class KeyboardHandler:
 
 
     def send_backspaces(self, count):
-        if self._input_method_state is not None and self._input_method_state["surrounding_text"] is not None:
+        if False and self._input_method_state is not None and self._input_method_state["surrounding_text"] is not None:
             self._input_method.delete_surrounding_text(count, 0)
             self._input_method.commit(self._input_method_serial)
         else:
